@@ -1,0 +1,200 @@
+# Compila o APK a partir do código-fonte deste fork.
+#
+# 1. Valida o Gradle wrapper (único binário de build commitado) contra os checksums oficiais.
+# 2. Regenera o bundle do agente (original-core.js e JSONs) com Node e compara com o commitado.
+#    Se diferir, mostra o resumo e o build segue com a versão recém-compilada.
+# 3. Compara src/ com o LearnHarness original na revisão de base (informativo).
+# 4. Roda os testes unitários e monta o APK debug, assinado com a chave própria do fork
+#    (secrets ANDROID_KEYSTORE_BASE64 e ANDROID_KEYSTORE_PASSWORD; ver gerar-chave.yml).
+# 5. Publica o APK como artifact "learnharness-mobile-debug" (só se assinado com a chave própria,
+#    para nunca instalar uma versão que depois não atualiza por cima).
+name: Build APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-apk-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Revisão do LearnHarness original em que este fork se baseia (ver README).
+  UPSTREAM_REPO: https://github.com/amosblomqvist/learnharness
+  UPSTREAM_REV: 6cba9c8
+  CORE_DIR: android/tools/original-core
+  CORE_ASSETS: android/app/src/main/assets/core
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      HAS_KEY: ${{ secrets.ANDROID_KEYSTORE_BASE64 != '' && secrets.ANDROID_KEYSTORE_PASSWORD != '' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validar Gradle wrapper (checksum oficial)
+        uses: gradle/actions/wrapper-validation@v4
+
+      # ---------- Bundle do agente ----------
+      - name: Instalar Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: android/tools/original-core/package-lock.json
+
+      - name: npm ci
+        working-directory: ${{ env.CORE_DIR }}
+        run: npm ci
+
+      - name: npm run build (regenera original-core.js)
+        working-directory: ${{ env.CORE_DIR }}
+        run: npm run build
+
+      - name: npm run test
+        working-directory: ${{ env.CORE_DIR }}
+        run: npm run test
+
+      - name: Comparar bundle recompilado com o commitado
+        run: |
+          set -euo pipefail
+          novo=$(sha256sum "$CORE_ASSETS/original-core.js" | cut -d' ' -f1)
+          antigo=$(git show "HEAD:$CORE_ASSETS/original-core.js" | sha256sum | cut -d' ' -f1)
+          mudou=$(git status --porcelain --untracked-files=all -- "$CORE_ASSETS")
+          {
+            echo "## Bundle do agente"
+            echo ""
+            echo "| | SHA-256 de original-core.js |"
+            echo "|---|---|"
+            echo "| commitado | \`$antigo\` |"
+            echo "| recompilado | \`$novo\` |"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ -z "$mudou" ]; then
+            echo "IDÊNTICO: o bundle recompilado a partir do código-fonte é byte a byte igual ao commitado ($novo)."
+            echo "✅ **Idêntico.** Todos os arquivos de \`$CORE_ASSETS\` regenerados batem com o commit." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::warning title=Bundle diferente::O bundle recompilado difere do commitado. O APK usa a versão recém-compilada."
+            echo "DIFERENTE. Arquivos alterados:"
+            echo "$mudou"
+            echo "--- resumo (git diff --stat) ---"
+            git diff --stat -- "$CORE_ASSETS"
+            echo "--- primeiras 300 linhas do diff ---"
+            git diff -U2 -- "$CORE_ASSETS" | head -n 300
+            {
+              echo "⚠️ **Diferente.** O APK foi montado com a versão **recém-compilada**."
+              echo ""
+              echo '```'
+              echo "$mudou"
+              git diff --stat -- "$CORE_ASSETS"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Comparar src/ com o LearnHarness original (informativo)
+        run: |
+          set -euo pipefail
+          up="$RUNNER_TEMP/upstream"
+          git clone --quiet --filter=blob:none --no-checkout "$UPSTREAM_REPO" "$up"
+          git -C "$up" checkout --quiet "$UPSTREAM_REV" -- src
+          echo "## src/ vs upstream $UPSTREAM_REV" >> "$GITHUB_STEP_SUMMARY"
+          # Só os arquivos que existem neste fork (o fork traz um subconjunto de src/ do original).
+          diff -rq "$up/src" src > "$RUNNER_TEMP/src.all" || true
+          grep -v "^Only in $up/src" "$RUNNER_TEMP/src.all" > "$RUNNER_TEMP/src.diff" || true
+          if [ -s "$RUNNER_TEMP/src.diff" ]; then
+            echo "::notice title=src difere do upstream::Arquivos alterados ou adicionados em relação a $UPSTREAM_REV (esperado se você mexeu em src/)."
+            cat "$RUNNER_TEMP/src.diff"
+            { echo "ℹ️ Diferenças em relação ao original:"; echo '```'; cat "$RUNNER_TEMP/src.diff"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "src/ é idêntico ao LearnHarness original em $UPSTREAM_REV."
+            echo "✅ **Idêntico** ao original em \`$UPSTREAM_REV\` (prompts e núcleo sem alteração)." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      # ---------- Android ----------
+      - name: Instalar JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Instalar Android SDK (platform 36)
+        run: |
+          set -euo pipefail
+          sdkm="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$sdkm" --licenses > /dev/null || true
+          "$sdkm" --install "platforms;android-36" "platform-tools" "build-tools;35.0.0" > /dev/null
+          echo "sdk.dir=$ANDROID_HOME" > android/local.properties
+
+      - name: Cache do Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Decodificar keystore do fork
+        if: env.HAS_KEY == 'true'
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$KEYSTORE_B64" | tr -d '[:space:]' | base64 -d > "$RUNNER_TEMP/fork.p12"
+          echo "LH_KEYSTORE_FILE=$RUNNER_TEMP/fork.p12" >> "$GITHUB_ENV"
+
+      - name: Aviso - sem chave própria
+        if: env.HAS_KEY != 'true'
+        run: |
+          echo "::warning title=Sem chave de assinatura::Secrets ANDROID_KEYSTORE_BASE64/ANDROID_KEYSTORE_PASSWORD ausentes. O build roda para validar o código, mas o APK NÃO será publicado (sairia com chave temporária e não atualizaria por cima). Veja android/docs/build-pelo-celular.md."
+
+      - name: Testes unitários e APK debug
+        working-directory: android
+        env:
+          LH_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+        run: ./gradlew --no-daemon --stacktrace :app:testDebugUnitTest :app:assembleDebug
+
+      - name: Conferir assinatura, permissões e endereços de rede
+        run: |
+          set -euo pipefail
+          apk=android/app/build/outputs/apk/debug/app-debug.apk
+          bt="$ANDROID_HOME/build-tools/35.0.0"
+          mkdir -p dist
+          cp "$apk" dist/learnharness-mobile-debug.apk
+          sha=$(sha256sum dist/learnharness-mobile-debug.apk | cut -d' ' -f1)
+          certs=$("$bt/apksigner" verify --print-certs dist/learnharness-mobile-debug.apk)
+          echo "$certs"
+          if [ "$HAS_KEY" = "true" ] && echo "$certs" | grep -q "CN=Android Debug"; then
+            echo "::error::Os secrets existem, mas o APK saiu com a chave debug padrão."; exit 1
+          fi
+          perms=$("$bt/aapt2" dump permissions dist/learnharness-mobile-debug.apk)
+          hosts=$(grep -rhoE "https?://[A-Za-z0-9.-]+" android/app/src/main/java "$CORE_ASSETS/original-core.js" android/app/src/main/assets/interactive | sort -u)
+          {
+            echo "## APK"
+            echo ""
+            echo "SHA-256 do APK: \`$sha\`"
+            echo ""
+            echo "**Certificado de assinatura**"
+            echo '```'; echo "$certs" | grep -E "certificate (DN|SHA-256)"; echo '```'
+            echo "**Permissões (manifest final, incluindo bibliotecas)**"
+            echo '```'; echo "$perms"; echo '```'
+            echo "<details><summary>Endereços http(s) no código Java, bundle e assets interativos</summary>"
+            echo ""
+            echo '```'; echo "$hosts"; echo '```'
+            echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "$perms"
+
+      - name: Publicar APK
+        if: env.HAS_KEY == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: learnharness-mobile-debug
+          path: dist/learnharness-mobile-debug.apk
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Apagar keystore do runner
+        if: always()
+        run: rm -f "$RUNNER_TEMP/fork.p12" android/local.properties

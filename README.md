@@ -30,6 +30,8 @@ npm run --prefix android/tools/original-core test
 
 The original learning/core sources are retained in `src/` to reproduce the agent bundle and verbatim prompt assets. The desktop/web app is maintained in the original repository.
 
+This fork builds its own signed APK with GitHub Actions; see [android/docs/build-pelo-celular.md](android/docs/build-pelo-celular.md).
+
 ## APK signing
 
 The release APK is signed with a dedicated distribution key. Signing keys are stored outside this repository and are never included in Git or releases. `:app:assembleRelease` produces an unsigned APK; sign your own distribution using Android SDK `apksigner`. Locally generated debug builds use your own debug key and cannot update the published APK without uninstalling first.

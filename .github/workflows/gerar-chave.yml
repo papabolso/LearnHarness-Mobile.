@@ -1,0 +1,68 @@
+# Gera, UMA VEZ, a chave de assinatura própria do fork (keystore PKCS12).
+#
+# Antes: crie o secret ANDROID_KEYSTORE_PASSWORD com uma senha longa (guarde-a também no seu
+# gerenciador de senhas). O keystore sai protegido por essa senha, que só existe nos secrets.
+#
+# Saída: artifact "chave-assinatura" (expira em 1 dia) com ANDROID_KEYSTORE_BASE64.txt.
+# Copie o conteúdo para o secret ANDROID_KEYSTORE_BASE64, guarde uma cópia de segurança
+# fora do GitHub e apague o artifact. Sem essa chave, versões futuras não atualizam por cima.
+#
+# Se ANDROID_KEYSTORE_BASE64 já existir, o workflow se recusa a rodar (evita trocar a chave
+# sem querer, o que obrigaria a desinstalar o app e perder os dados).
+name: Gerar chave de assinatura (uma vez)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  gerar:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checar secrets
+        env:
+          PW: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          JA_EXISTE: ${{ secrets.ANDROID_KEYSTORE_BASE64 != '' }}
+        run: |
+          if [ "$JA_EXISTE" = "true" ]; then
+            echo "::error::ANDROID_KEYSTORE_BASE64 já existe. Para não trocar a chave por engano, apague esse secret antes se quiser mesmo gerar outra."
+            exit 1
+          fi
+          if [ ${#PW} -lt 16 ]; then
+            echo "::error::Crie antes o secret ANDROID_KEYSTORE_PASSWORD com pelo menos 16 caracteres."
+            exit 1
+          fi
+
+      - name: Instalar JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Gerar keystore
+        env:
+          PW: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          umask 077
+          mkdir -p out
+          keytool -genkeypair -noprompt \
+            -storetype PKCS12 -keystore "$RUNNER_TEMP/fork.p12" \
+            -alias learnharness -keyalg RSA -keysize 4096 -validity 36500 \
+            -dname "CN=LearnHarness Mobile (fork pessoal)" \
+            -storepass:env PW -keypass:env PW
+          base64 -w0 "$RUNNER_TEMP/fork.p12" > out/ANDROID_KEYSTORE_BASE64.txt
+          # Impressão digital do certificado (pública): confira com a que aparece no resumo do build.
+          keytool -list -v -keystore "$RUNNER_TEMP/fork.p12" -storepass:env PW | grep -E "SHA256:" | tee out/impressao-digital.txt
+          rm -f "$RUNNER_TEMP/fork.p12"
+
+      - name: Publicar (expira em 1 dia)
+        uses: actions/upload-artifact@v4
+        with:
+          name: chave-assinatura
+          path: out/
+          retention-days: 1
+          if-no-files-found: error

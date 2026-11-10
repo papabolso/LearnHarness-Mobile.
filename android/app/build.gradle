@@ -23,6 +23,22 @@ android {
             buildConfigField 'boolean', 'DEFAULT_EINK', 'true'
         }
     }
+    // Assinatura própria do fork (só no CI). O workflow build-apk.yml decodifica o keystore guardado
+    // em secret e passa caminho/senha por variáveis de ambiente. Sem elas (build local), o Gradle
+    // usa a chave debug padrão, como antes. O keystore nunca entra no repositório.
+    def forkKeystore = System.getenv('LH_KEYSTORE_FILE')
+    if (forkKeystore) {
+        signingConfigs {
+            fork {
+                storeFile file(forkKeystore)
+                storeType 'pkcs12'
+                storePassword System.getenv('LH_KEYSTORE_PASSWORD')
+                keyAlias System.getenv('LH_KEY_ALIAS') ?: 'learnharness'
+                keyPassword System.getenv('LH_KEYSTORE_PASSWORD')
+            }
+        }
+        buildTypes.debug.signingConfig signingConfigs.fork
+    }
     buildFeatures { buildConfig true }
     compileOptions { sourceCompatibility JavaVersion.VERSION_17; targetCompatibility JavaVersion.VERSION_17 }
     testOptions { unitTests.returnDefaultValues = true }
