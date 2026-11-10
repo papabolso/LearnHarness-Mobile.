@@ -37,7 +37,7 @@ android {
                 keyPassword System.getenv('LH_KEYSTORE_PASSWORD')
             }
         }
-        buildTypes.debug.signingConfig signingConfigs.fork
+        buildTypes.debug.signingConfig = signingConfigs.fork
     }
     buildFeatures { buildConfig true }
     compileOptions { sourceCompatibility JavaVersion.VERSION_17; targetCompatibility JavaVersion.VERSION_17 }
